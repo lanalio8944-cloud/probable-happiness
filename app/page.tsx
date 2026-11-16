@@ -1,10 +1,11 @@
-import MathCaptchaForm from "@/app/components/MathCaptchaForm";
+import RecaptchaGate from "@/app/components/RecaptchaGate";
 import { getRedirectDestination } from "@/lib/security";
 
 export const dynamic = "force-dynamic";
 
 export default function HomePage() {
   const destination = getRedirectDestination();
+  const siteKey = process.env.NEXT_PUBLIC_RECAPTCHA_SITE_KEY;
 
   return (
     <main className="page-shell">
@@ -13,8 +14,8 @@ export default function HomePage() {
         <p className="eyebrow">GERBANG TAUTAN</p>
         <h1 id="page-title">Verifikasi sebelum melanjutkan</h1>
         <p className="intro">
-          Selesaikan soal penjumlahan sederhana untuk membuka tautan. Tujuan
-          ditampilkan terlebih dahulu agar Anda tahu ke mana tautan akan membawa.
+          Selesaikan verifikasi reCAPTCHA untuk membuka tombol menuju situs utama.
+          Tujuan ditampilkan terlebih dahulu agar Anda tahu ke mana tautan akan membawa.
         </p>
 
         {destination ? (
@@ -29,11 +30,16 @@ export default function HomePage() {
           </p>
         )}
 
-        <MathCaptchaForm disabled={!destination} />
+        {siteKey ? (
+          <RecaptchaGate siteKey={siteKey} disabled={!destination} />
+        ) : (
+          <p className="setup-notice" role="status">
+            reCAPTCHA belum dikonfigurasi. Admin perlu menambahkan Site Key di environment.
+          </p>
+        )}
+
         <p className="privacy-note">
-          Soal berlaku 5 menit. Anda memiliki maksimal 5 jawaban untuk setiap
-          soal. Verifikasi yang berhasil berlaku singkat dan hanya dapat dipakai
-          sekali.
+          Verifikasi dilakukan di server dengan Google. Setelah berhasil, tekan tombol untuk melanjutkan.
         </p>
       </section>
     </main>

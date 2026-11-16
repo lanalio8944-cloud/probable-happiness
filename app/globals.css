@@ -43,12 +43,8 @@ h1 { margin: 0; font-size: clamp(25px, 6vw, 32px); line-height: 1.2; }
 .destination strong { overflow-wrap: anywhere; }
 .setup-notice { padding: 12px; border: 1px solid #825f31; border-radius: 10px; color: #ffe0a6; line-height: 1.5; }
 .captcha-form { display: grid; gap: 12px; margin-top: 24px; }
-.question-box { display: grid; gap: 8px; padding: 18px; border-radius: 12px; background: #0d1420; text-align: center; }
-.question-label { color: var(--muted); font-size: 13px; }
-.question { font-size: 30px; font-weight: 700; letter-spacing: .04em; }
-.captcha-form label { margin-top: 4px; font-weight: 600; }
-.field-help { margin: -7px 0 0; }
-.captcha-form input { width: 100%; min-height: 48px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 9px; background: #0d1420; color: var(--text); }
+.captcha-container { min-height: 78px; display: flex; justify-content: center; overflow-x: auto; }
+.field-help { margin: 0; line-height: 1.6; }
 .primary-button, .secondary-button { min-height: 48px; padding: 10px 14px; border: 0; border-radius: 9px; font-weight: 700; cursor: pointer; }
 .primary-button { margin-top: 4px; background: var(--accent); color: #08251b; }
 .secondary-button { border: 1px solid var(--border); background: transparent; color: var(--text); }

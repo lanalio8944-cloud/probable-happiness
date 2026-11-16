@@ -1,29 +1,9 @@
 import "server-only";
 
-import { createHmac, randomInt, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 
-const MAX_ATTEMPTS = 5;
-const CHALLENGE_TTL_SECONDS = 300;
 const SESSION_TTL_SECONDS = 120;
-
-export const CHALLENGE_COOKIE = "math_challenge";
 export const SESSION_COOKIE = "redirect_session";
-
-export type MathChallenge = {
-  challengeId: string;
-  question: string;
-  expiresIn: number;
-  token: string;
-};
-
-type ChallengePayload = {
-  type: "challenge";
-  id: string;
-  a: number;
-  b: number;
-  attempts: number;
-  exp: number;
-};
 
 type SessionPayload = {
   type: "redirect";
@@ -62,51 +42,6 @@ function readSignedPayload<T>(token: string): T | null {
   } catch {
     return null;
   }
-}
-
-export function createChallenge(): MathChallenge {
-  const a = randomInt(1, 10);
-  const b = randomInt(1, 10);
-  const challengeId = randomUUID();
-  const token = signPayload({
-    type: "challenge",
-    id: challengeId,
-    a,
-    b,
-    attempts: 0,
-    exp: Math.floor(Date.now() / 1000) + CHALLENGE_TTL_SECONDS,
-  } satisfies ChallengePayload);
-
-  return { challengeId, question: `${a} + ${b}`, expiresIn: CHALLENGE_TTL_SECONDS, token };
-}
-
-export type ChallengeCheck =
-  | { status: "invalid" | "expired" | "locked" }
-  | { status: "incorrect"; attemptsLeft: number; updatedToken: string }
-  | { status: "correct" };
-
-export function checkChallenge(token: string, challengeId: string, answer: number): ChallengeCheck {
-  const payload = readSignedPayload<ChallengePayload>(token);
-  const now = Math.floor(Date.now() / 1000);
-
-  if (
-    !payload || payload.type !== "challenge" || typeof payload.id !== "string" ||
-    !Number.isInteger(payload.a) || !Number.isInteger(payload.b) ||
-    !Number.isInteger(payload.attempts) || !Number.isInteger(payload.exp) ||
-    payload.id !== challengeId
-  ) return { status: "invalid" };
-  if (payload.exp <= now) return { status: "expired" };
-  if (payload.attempts >= MAX_ATTEMPTS) return { status: "locked" };
-  if (answer === payload.a + payload.b) return { status: "correct" };
-
-  const attempts = payload.attempts + 1;
-  if (attempts >= MAX_ATTEMPTS) return { status: "locked" };
-
-  return {
-    status: "incorrect",
-    attemptsLeft: MAX_ATTEMPTS - attempts,
-    updatedToken: signPayload({ ...payload, attempts } satisfies ChallengePayload),
-  };
 }
 
 export function createRedirectSession(): string {
@@ -158,14 +93,6 @@ export function isSameOrigin(request: Request): boolean {
   }
 }
 
-export const challengeCookieOptions = {
-  httpOnly: true,
-  secure: process.env.NODE_ENV === "production",
-  sameSite: "strict" as const,
-  path: "/api",
-  maxAge: CHALLENGE_TTL_SECONDS,
-};
-
 export const sessionCookieOptions = {
   httpOnly: true,
   secure: process.env.NODE_ENV === "production",
@@ -174,5 +101,4 @@ export const sessionCookieOptions = {
   maxAge: SESSION_TTL_SECONDS,
 };
 
-export const expiredChallengeCookieOptions = { ...challengeCookieOptions, maxAge: 0 };
 export const expiredSessionCookieOptions = { ...sessionCookieOptions, maxAge: 0 };

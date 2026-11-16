@@ -2,82 +2,82 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 
 import {
-  CHALLENGE_COOKIE,
-  SESSION_COOKIE,
-  checkChallenge,
   createRedirectSession,
-  expiredChallengeCookieOptions,
   isSameOrigin,
   sessionCookieOptions,
 } from "@/lib/security";
 
 export const runtime = "nodejs";
 
-const schema = z.object({
-  challengeId: z.string().uuid(),
-  answer: z.string().regex(/^\d{1,2}$/),
-}).strict();
+const schema = z.object({ token: z.string().min(1).max(8192) }).strict();
+
+type RecaptchaResponse = {
+  success?: boolean;
+  hostname?: string;
+  challenge_ts?: string;
+  "error-codes"?: string[];
+};
 
 export async function POST(request: Request) {
   if (!isSameOrigin(request)) return json({ error: "Permintaan tidak valid." }, 403);
-  if (!request.headers.get("cookie")?.includes(`${CHALLENGE_COOKIE}=`)) {
-    return json({ error: "Soal kedaluwarsa. Silakan minta soal baru.", code: "expired" }, 410);
+
+  const siteSecret = process.env.RECAPTCHA_SECRET_KEY;
+  const allowedHostnames = (process.env.RECAPTCHA_ALLOWED_HOSTNAMES ?? "")
+    .split(",")
+    .map((hostname) => hostname.trim().toLowerCase())
+    .filter(Boolean);
+
+  if (!siteSecret || allowedHostnames.length === 0) {
+    return json({ error: "Layanan CAPTCHA belum dikonfigurasi." }, 503);
+  }
+  if (!process.env.NEXT_PUBLIC_RECAPTCHA_SITE_KEY) {
+    return json({ error: "Site Key reCAPTCHA belum dikonfigurasi." }, 503);
+  }
+  if (!process.env.SESSION_SECRET || Buffer.byteLength(process.env.SESSION_SECRET, "utf8") < 32) {
+    return json({ error: "Secret sesi belum dikonfigurasi dengan benar." }, 503);
   }
 
   const contentLength = Number(request.headers.get("content-length") ?? 0);
-  if (contentLength > 2048) return json({ error: "Permintaan terlalu besar." }, 413);
+  if (contentLength > 12_000) return json({ error: "Permintaan terlalu besar." }, 413);
 
   try {
     const body = schema.safeParse(await request.json());
-    if (!body.success) return json({ error: "Masukkan jawaban angka yang valid." }, 400);
+    if (!body.success) return json({ error: "Token CAPTCHA tidak valid." }, 400);
 
-    const token = getCookie(request.headers.get("cookie") ?? "", CHALLENGE_COOKIE);
-    if (!token) return json({ error: "Soal kedaluwarsa. Silakan minta soal baru.", code: "expired" }, 410);
+    const googleResponse = await fetch("https://www.google.com/recaptcha/api/siteverify", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ secret: siteSecret, response: body.data.token }),
+      cache: "no-store",
+      signal: AbortSignal.timeout(8000),
+    });
 
-    const result = checkChallenge(token, body.data.challengeId, Number(body.data.answer));
-    if (result.status === "expired" || result.status === "invalid") {
-      const response = json({ error: "Soal kedaluwarsa. Silakan minta soal baru.", code: "expired" }, 410);
-      response.cookies.set(CHALLENGE_COOKIE, "", expiredChallengeCookieOptions);
-      return response;
-    }
-    if (result.status === "locked") {
-      const response = json({ error: "Batas percobaan soal habis. Silakan minta soal baru.", code: "locked" }, 429);
-      response.cookies.set(CHALLENGE_COOKIE, "", expiredChallengeCookieOptions);
-      return response;
-    }
-    if (result.status === "incorrect") {
-      const response = json({
-        error: `Jawaban belum tepat. Sisa percobaan: ${result.attemptsLeft}.`,
-        code: "incorrect",
-        attemptsLeft: result.attemptsLeft,
-      }, 400);
-      response.cookies.set(CHALLENGE_COOKIE, result.updatedToken, challengeCookieOptions);
-      return response;
-    }
+    if (!googleResponse.ok) return json({ error: "Layanan CAPTCHA sedang tidak tersedia." }, 503);
+
+    const result = await googleResponse.json() as RecaptchaResponse;
+    const valid = result.success === true &&
+      typeof result.hostname === "string" &&
+      allowedHostnames.includes(result.hostname.toLowerCase());
+
+    if (!valid) return json({ error: "Verifikasi CAPTCHA gagal. Silakan coba lagi." }, 403);
 
     const response = NextResponse.json({ success: true }, {
       headers: { "Cache-Control": "no-store" },
     });
-    response.cookies.set(CHALLENGE_COOKIE, "", expiredChallengeCookieOptions);
-    response.cookies.set(SESSION_COOKIE, createRedirectSession(), sessionCookieOptions);
+    response.cookies.set("redirect_session", createRedirectSession(), sessionCookieOptions);
     return response;
   } catch {
-    return json({ error: "Verifikasi sementara tidak tersedia. Coba lagi." }, 503);
+    return json({ error: "Verifikasi CAPTCHA tidak dapat diselesaikan. Silakan coba lagi." }, 503);
   }
 }
 
-function getCookie(cookieHeader: string, name: string): string | null {
-  for (const part of cookieHeader.split(";")) {
-    const separator = part.indexOf("=");
-    if (separator < 0) continue;
-    if (part.slice(0, separator).trim() === name) return part.slice(separator + 1).trim();
-  }
-  return null;
+export async function GET() {
+  return json({ error: "Metode tidak diizinkan." }, 405, { Allow: "POST" });
 }
 
-function json(body: unknown, status: number) {
+function json(body: unknown, status: number, extraHeaders?: Record<string, string>) {
   return NextResponse.json(body, {
     status,
-    headers: { "Cache-Control": "no-store" },
+    headers: { "Cache-Control": "no-store", ...extraHeaders },
   });
 }
