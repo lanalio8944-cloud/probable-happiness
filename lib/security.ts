@@ -1,30 +1,128 @@
-import { randomInt, randomBytes, randomUUID } from "node:crypto";
-import { isIP } from "node:net";
-import { Redis } from "@upstash/redis";
-import { Ratelimit } from "@upstash/ratelimit";
+import "server-only";
+
+import { createHmac, randomInt, randomUUID, timingSafeEqual } from "node:crypto";
 
 const MAX_ATTEMPTS = 5;
 const CHALLENGE_TTL_SECONDS = 300;
 const SESSION_TTL_SECONDS = 120;
 
-let redisInstance: Redis | undefined;
-const limiters = new Map<string, Ratelimit>();
+export const CHALLENGE_COOKIE = "math_challenge";
+export const SESSION_COOKIE = "redirect_session";
 
 export type MathChallenge = {
   challengeId: string;
   question: string;
   expiresIn: number;
+  token: string;
 };
 
-export function getRedis(): Redis {
-  if (redisInstance) return redisInstance;
+type ChallengePayload = {
+  type: "challenge";
+  id: string;
+  a: number;
+  b: number;
+  attempts: number;
+  exp: number;
+};
 
-  const url = process.env.UPSTASH_REDIS_REST_URL;
-  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (!url || !token) throw new Error("Upstash Redis is not configured");
+type SessionPayload = {
+  type: "redirect";
+  exp: number;
+  nonce: string;
+};
 
-  redisInstance = new Redis({ url, token });
-  return redisInstance;
+function getSecret(): string {
+  const secret = process.env.SESSION_SECRET;
+  if (!secret || Buffer.byteLength(secret, "utf8") < 32) {
+    throw new Error("SESSION_SECRET must contain at least 32 bytes");
+  }
+  return secret;
+}
+
+function signPayload(payload: object): string {
+  const encoded = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const signature = createHmac("sha256", getSecret()).update(encoded).digest("base64url");
+  return `${encoded}.${signature}`;
+}
+
+function readSignedPayload<T>(token: string): T | null {
+  const parts = token.split(".");
+  if (parts.length !== 2) return null;
+
+  const [encoded, suppliedSignature] = parts;
+  if (!encoded || !suppliedSignature || !/^[A-Za-z0-9_-]+$/.test(suppliedSignature)) return null;
+
+  try {
+    const expected = createHmac("sha256", getSecret()).update(encoded).digest();
+    const supplied = Buffer.from(suppliedSignature, "base64url");
+    if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) return null;
+
+    const parsed: unknown = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+    return parsed && typeof parsed === "object" ? parsed as T : null;
+  } catch {
+    return null;
+  }
+}
+
+export function createChallenge(): MathChallenge {
+  const a = randomInt(1, 10);
+  const b = randomInt(1, 10);
+  const challengeId = randomUUID();
+  const token = signPayload({
+    type: "challenge",
+    id: challengeId,
+    a,
+    b,
+    attempts: 0,
+    exp: Math.floor(Date.now() / 1000) + CHALLENGE_TTL_SECONDS,
+  } satisfies ChallengePayload);
+
+  return { challengeId, question: `${a} + ${b}`, expiresIn: CHALLENGE_TTL_SECONDS, token };
+}
+
+export type ChallengeCheck =
+  | { status: "invalid" | "expired" | "locked" }
+  | { status: "incorrect"; attemptsLeft: number; updatedToken: string }
+  | { status: "correct" };
+
+export function checkChallenge(token: string, challengeId: string, answer: number): ChallengeCheck {
+  const payload = readSignedPayload<ChallengePayload>(token);
+  const now = Math.floor(Date.now() / 1000);
+
+  if (
+    !payload || payload.type !== "challenge" || typeof payload.id !== "string" ||
+    !Number.isInteger(payload.a) || !Number.isInteger(payload.b) ||
+    !Number.isInteger(payload.attempts) || !Number.isInteger(payload.exp) ||
+    payload.id !== challengeId
+  ) return { status: "invalid" };
+  if (payload.exp <= now) return { status: "expired" };
+  if (payload.attempts >= MAX_ATTEMPTS) return { status: "locked" };
+  if (answer === payload.a + payload.b) return { status: "correct" };
+
+  const attempts = payload.attempts + 1;
+  if (attempts >= MAX_ATTEMPTS) return { status: "locked" };
+
+  return {
+    status: "incorrect",
+    attemptsLeft: MAX_ATTEMPTS - attempts,
+    updatedToken: signPayload({ ...payload, attempts } satisfies ChallengePayload),
+  };
+}
+
+export function createRedirectSession(): string {
+  return signPayload({
+    type: "redirect",
+    exp: Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS,
+    nonce: randomUUID(),
+  } satisfies SessionPayload);
+}
+
+export function verifyRedirectSession(token: string): boolean {
+  const payload = readSignedPayload<SessionPayload>(token);
+  return Boolean(
+    payload && payload.type === "redirect" && Number.isInteger(payload.exp) &&
+    payload.exp > Math.floor(Date.now() / 1000) && typeof payload.nonce === "string",
+  );
 }
 
 export function getRedirectDestination(): URL | null {
@@ -39,130 +137,42 @@ export function getRedirectDestination(): URL | null {
   try {
     const destination = new URL(rawDestination);
     if (
-      destination.protocol !== "https:" ||
-      destination.username ||
-      destination.password ||
+      destination.protocol !== "https:" || destination.username || destination.password ||
       !allowedHosts.includes(destination.hostname.toLowerCase())
-    ) {
-      return null;
-    }
+    ) return null;
     return destination;
   } catch {
     return null;
   }
 }
 
-export function getClientIp(request: Request): string | null {
-  // On Vercel, x-forwarded-for is supplied by the platform proxy. If hosting
-  // elsewhere, configure a trusted proxy that overwrites this header.
-  const forwarded = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
-  const realIp = request.headers.get("x-real-ip")?.trim();
-  const candidate = forwarded || realIp;
-  return candidate && isIP(candidate) ? candidate : null;
-}
+export function isSameOrigin(request: Request): boolean {
+  const origin = request.headers.get("origin");
+  const configuredOrigin = process.env.APP_ORIGIN;
+  if (!origin || !configuredOrigin) return false;
 
-export async function checkRateLimit(
-  redis: Redis,
-  scope: string,
-  identity: string,
-  count: number,
-  window: `${number} m`,
-): Promise<{ success: boolean }> {
-  const key = `${scope}:${count}:${window}`;
-  let limiter = limiters.get(key);
-  if (!limiter) {
-    limiter = new Ratelimit({
-      redis,
-      limiter: Ratelimit.slidingWindow(count, window),
-      prefix: `math-redirect:${scope}`,
-    });
-    limiters.set(key, limiter);
+  try {
+    return new URL(origin).origin === new URL(configuredOrigin).origin;
+  } catch {
+    return false;
   }
-  return limiter.limit(identity);
 }
 
-export async function createChallenge(redis: Redis): Promise<MathChallenge> {
-  const first = randomInt(1, 10);
-  const second = randomInt(1, 10);
-  const challengeId = randomUUID();
-  await redis.set(
-    `math-challenge:${challengeId}`,
-    JSON.stringify({ answer: first + second, attempts: 0 }),
-    { ex: CHALLENGE_TTL_SECONDS },
-  );
-
-  return {
-    challengeId,
-    question: `${first} + ${second}`,
-    expiresIn: CHALLENGE_TTL_SECONDS,
-  };
-}
-
-const VERIFY_CHALLENGE_SCRIPT = `
-local raw = redis.call('GET', KEYS[1])
-if not raw then
-  return cjson.encode({ status = 'expired', attemptsLeft = 0 })
-end
-local challenge = cjson.decode(raw)
-local attempts = tonumber(challenge.attempts) or 0
-if attempts >= tonumber(ARGV[2]) then
-  redis.call('DEL', KEYS[1])
-  return cjson.encode({ status = 'locked', attemptsLeft = 0 })
-end
-attempts = attempts + 1
-if tonumber(ARGV[1]) == tonumber(challenge.answer) then
-  redis.call('DEL', KEYS[1])
-  return cjson.encode({ status = 'correct', attemptsLeft = tonumber(ARGV[2]) - attempts })
-end
-if attempts >= tonumber(ARGV[2]) then
-  redis.call('DEL', KEYS[1])
-  return cjson.encode({ status = 'locked', attemptsLeft = 0 })
-end
-local ttl = redis.call('TTL', KEYS[1])
-redis.call('SET', KEYS[1], cjson.encode({ answer = challenge.answer, attempts = attempts }), 'EX', ttl)
-return cjson.encode({ status = 'incorrect', attemptsLeft = tonumber(ARGV[2]) - attempts })
-`;
-
-type ChallengeResult = {
-  status: "expired" | "locked" | "incorrect" | "correct";
-  attemptsLeft: number;
+export const challengeCookieOptions = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === "production",
+  sameSite: "strict" as const,
+  path: "/api",
+  maxAge: CHALLENGE_TTL_SECONDS,
 };
 
-export async function verifyChallengeAnswer(
-  redis: Redis,
-  challengeId: string,
-  answer: number,
-): Promise<ChallengeResult> {
-  const raw = await redis.eval<string>(
-    VERIFY_CHALLENGE_SCRIPT,
-    [`math-challenge:${challengeId}`],
-    [answer, MAX_ATTEMPTS],
-  );
-  return typeof raw === "string" ? JSON.parse(raw) as ChallengeResult : raw as ChallengeResult;
-}
+export const sessionCookieOptions = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === "production",
+  sameSite: "strict" as const,
+  path: "/r",
+  maxAge: SESSION_TTL_SECONDS,
+};
 
-export async function createRedirectSession(redis: Redis): Promise<string> {
-  const token = randomBytes(32).toString("base64url");
-  const created = await redis.set(`redirect-session:${token}`, "1", {
-    ex: SESSION_TTL_SECONDS,
-    nx: true,
-  });
-  if (created !== "OK") throw new Error("Could not create redirect session");
-  return token;
-}
-
-const CONSUME_SESSION_SCRIPT = `
-local value = redis.call('GET', KEYS[1])
-if value then redis.call('DEL', KEYS[1]) end
-return value
-`;
-
-export async function consumeRedirectSession(token: string): Promise<boolean> {
-  const redis = getRedis();
-  const value = await redis.eval<string>(
-    CONSUME_SESSION_SCRIPT,
-    [`redirect-session:${token}`],
-    [],
-  );
-  return value === "1";
-}
+export const expiredChallengeCookieOptions = { ...challengeCookieOptions, maxAge: 0 };
+export const expiredSessionCookieOptions = { ...sessionCookieOptions, maxAge: 0 };
